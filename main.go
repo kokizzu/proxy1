@@ -1,108 +1,151 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"log"
+	"net"
 	"net/http"
-	"time"
-
-	"github.com/hauke96/sigolo"
+	"strings"
 )
 
-const configPath = "./tiny.json"
+const LISTEN = `:20`
+const CACHEDIR = `./cache/`
 
-var config *Config
-var cache *Cache
+var cache *Cache 
 
-var client *http.Client
+// Hop-by-hop headers. These are removed when sent to the backend.
+// http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
+var hopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te", // canonicalized version of "TE"
+	"Trailers",
+	"Transfer-Encoding",
+	"Upgrade",
+}
 
-func main() {
-	prepare()
-
-	sigolo.Info("Ready to serve")
-
-	server := &http.Server{
-		Addr:         ":" + config.Port,
-		WriteTimeout: 30 * time.Second,
-		ReadTimeout:  30 * time.Second,
-		Handler:      http.HandlerFunc(handleGet),
-	}
-
-	err := server.ListenAndServe()
-	if err != nil {
-		sigolo.Fatal(err.Error())
+func copyHeader(dst, src http.Header) {
+	for k, vv := range src {
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
 	}
 }
 
-func configureLogging() {
-	sigolo.FormatFunctions[sigolo.LOG_INFO] = sigolo.LogPlain
-	//sigolo.LogLevel = sigolo.LOG_DEBUG
-}
-
-func prepare() {
-	var err error
-
-	sigolo.Info("Load config")
-	config, err = LoadConfig(configPath)
-	if err != nil {
-		sigolo.Fatal("Could not read config: '%s'", err.Error())
-	}
-
-	sigolo.Info("Init cache")
-	cache, err = CreateCache(config.CacheFolder)
-
-	if err != nil {
-		sigolo.Fatal("Could not init cache: '%s'", err.Error())
-	}
-
-	client = &http.Client{
-		Timeout: time.Second * 30,
+func delHopHeaders(header http.Header) {
+	for _, h := range hopHeaders {
+		header.Del(h)
 	}
 }
 
-func handleGet(w http.ResponseWriter, r *http.Request) {
-	fullUrl := r.URL.Path + "?" + r.URL.RawQuery
-
-	sigolo.Info("Requested '%s'", fullUrl)
-
-	// Only pass request to target host when cache does not has an entry for the
-	// given URL.
-	if cache.has(fullUrl) {
-		content, err := cache.get(fullUrl)
-
-		if err != nil {
-			handleError(err, w)
-		} else {
-			w.Write(content)
-		}
-	} else {
-		response, err := client.Get(config.Target + fullUrl)
-		if err != nil {
-			handleError(err, w)
-			return
-		}
-
-		body, err := ioutil.ReadAll(response.Body)
-		response.Body.Close()
-		if err != nil {
-			handleError(err, w)
-			return
-		}
-
-		err = cache.put(fullUrl, body)
-
-		// Do not fail. Even if the put failed, the end user would be sad if he
-		// gets an error, even if the proxy alone works.
-		if err != nil {
-			sigolo.Error("Could not write into cache: %s", err)
-		}
-
-		w.Write(body)
+func appendHostToXForwardHeader(header http.Header, host string) {
+	// If we aren't the first proxy retain prior
+	// X-Forwarded-For information as a comma+space
+	// separated list and fold multiple headers into one.
+	if prior, ok := header["X-Forwarded-For"]; ok {
+		host = strings.Join(prior, ", ") + ", " + host
 	}
+	header.Set("X-Forwarded-For", host)
+}
+
+type proxy struct {
 }
 
 func handleError(err error, w http.ResponseWriter) {
-	sigolo.Error(err.Error())
+	fmt.Println(err.Error())
 	w.WriteHeader(500)
 	fmt.Fprintf(w, err.Error())
+}
+
+func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
+	log.Println(req.RemoteAddr, " ", req.Method, " ", req.URL)
+	if req.URL.Scheme == `` {
+		if req.URL.Port() == `443` {
+			req.URL.Scheme = "https"
+			req.URL.Host = req.URL.Hostname()
+		} else {
+			req.URL.Scheme = "http"
+		}
+	}
+	
+	fullUrl := req.URL.String()
+	fmt.Println(fullUrl)
+	
+	client := &http.Client{}
+
+	//http: Request.RequestURI can't be set in client requests.
+	//http://golang.org/src/pkg/net/http/client.go
+	req.RequestURI = ""
+
+	delHopHeaders(req.Header)
+
+	if req.Method == http.MethodGet && cache.has(fullUrl) {
+		fmt.Println(fullUrl)
+		content, err := cache.get(fullUrl)
+		if err != nil {
+			handleError(err, wr)
+		} else {
+			wr.Write(content)
+		}
+	} 
+	
+	if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+		appendHostToXForwardHeader(req.Header, clientIP)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(wr, "Server Error", http.StatusInternalServerError)
+		log.Fatal("ServeHTTP:", err)
+	}
+
+	defer resp.Body.Close()
+	log.Println(req.RemoteAddr, " ", resp.Status)
+	
+	if req.Method == http.MethodGet {
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			handleError(err, wr)
+			return
+		}
+		err = cache.put(fullUrl, body)
+		if err != nil {
+			fmt.Printf("Failed write into cache: %s\n", err)
+		}
+		wr.Write(body)
+	}
+
+	delHopHeaders(resp.Header)
+
+	copyHeader(wr.Header(), resp.Header)
+	wr.WriteHeader(resp.StatusCode)
+	if req.Method != http.MethodGet {
+		io.Copy(wr, resp.Body)
+	}
+	
+	
+}
+
+func main() {
+	addr := flag.String("LISTEN", LISTEN, "The LISTEN of the application.")
+	cacheDir := flag.String("CACHEDIR", CACHEDIR, "The CACHE DIRectory, please end with /")
+	flag.Parse()
+	var err error
+	cache, err = CreateCache(*cacheDir)
+	if err != nil {
+		fmt.Println(`Unable to create cache directory: ` + *cacheDir)
+		return
+	}
+	
+	handler := &proxy{}
+	
+	log.Println("Starting proxy server on", *addr)
+	if err := http.ListenAndServe(*addr, handler); err != nil {
+		log.Fatal("ListenAndServe:", err)
+	}
 }

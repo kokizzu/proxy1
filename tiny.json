@@ -1,5 +1,0 @@
-{
-	"port": "8080",
-	"target": "https://imgs.xkcd.com/",
-	"cache_folder": "./cache/"
-}
