@@ -34,4 +34,4 @@ go run *.go
 
 - **WARNING**: Does not work for https '__')
 - Caching code from the forked repo
-- Other code from [this gist](https://gist.github.com/yowu/f7dc34bd4736a65ff28d) 
+- Other code from [Yuwu's gist](https://gist.github.com/yowu/f7dc34bd4736a65ff28d) 
